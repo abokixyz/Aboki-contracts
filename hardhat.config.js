@@ -38,7 +38,7 @@ module.exports = {
     tests: "./test",
   },
   solidity: {
-    version: "0.8.23",
+    version: "0.8.30",
     settings: {
       optimizer: {
         enabled: true,
