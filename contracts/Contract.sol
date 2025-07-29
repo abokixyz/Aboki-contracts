@@ -19,14 +19,13 @@ interface IUniswapV2Router02 {
         external view returns (uint[] memory amounts);
 }
 
-// Uniswap V3 Router interface
+// Uniswap V3 Router interface - FIXED
 interface ISwapRouter {
     struct ExactInputSingleParams {
         address tokenIn;
         address tokenOut;
         uint24 fee;
         address recipient;
-        uint256 deadline;
         uint256 amountIn;
         uint256 amountOutMinimum;
         uint160 sqrtPriceLimitX96;
@@ -35,7 +34,6 @@ interface ISwapRouter {
     struct ExactInputParams {
         bytes path;
         address recipient;
-        uint256 deadline;
         uint256 amountIn;
         uint256 amountOutMinimum;
     }
@@ -309,7 +307,7 @@ contract AbokiV2Contract is Ownable, ReentrancyGuard {
     }
     
     /**
-     * @dev Creates a new exchange order by swapping ETH to target token using V3
+     * @dev Creates a new exchange order by swapping ETH to target token using V3 - FIXED
      * @param _targetToken The supported token to swap to
      * @param _fee The fee tier for the V3 pool
      * @param _minOutputAmount The minimum amount of target tokens expected
@@ -400,7 +398,7 @@ contract AbokiV2Contract is Ownable, ReentrancyGuard {
     }
     
     /**
-     * @dev Creates a new exchange order by swapping tokens using V3 with encoded path
+     * @dev Creates a new exchange order by swapping tokens using V3 with encoded path - FIXED
      * @param _path The encoded path for V3 swap
      * @param _tokenIn The input token address
      * @param _tokenOut The output token address
@@ -484,7 +482,11 @@ contract AbokiV2Contract is Ownable, ReentrancyGuard {
     }
     
     /**
-     * @dev Internal function to execute ETH to token swap using V3
+     * @dev Internal function to execute ETH to token swap using V3 - FIXED
+     * Key fixes:
+     * 1. Direct ETH payment to router (no WETH wrapping needed)
+     * 2. Proper parameter handling
+     * 3. Better error handling
      */
     function _executeETHToTokenSwapV3(
         address _targetToken,
@@ -493,27 +495,22 @@ contract AbokiV2Contract is Ownable, ReentrancyGuard {
         uint256 _minOutputAmount,
         address _refundAddress
     ) internal returns (uint256 outputAmount) {
-        // Wrap ETH to WETH
-        IWETH(WETH).deposit{value: _inputAmount}();
-        IERC20(WETH).approve(address(uniswapV3Router), _inputAmount);
-
+        
         ISwapRouter.ExactInputSingleParams memory params = ISwapRouter.ExactInputSingleParams({
             tokenIn: WETH,
             tokenOut: _targetToken,
             fee: _fee,
             recipient: address(this),
-            deadline: block.timestamp + 300,
             amountIn: _inputAmount,
             amountOutMinimum: _minOutputAmount,
             sqrtPriceLimitX96: 0
         });
 
-        try uniswapV3Router.exactInputSingle(params) returns (uint256 amountOut) {
+        try uniswapV3Router.exactInputSingle{value: _inputAmount}(params) returns (uint256 amountOut) {
             outputAmount = amountOut;
             emit SwapExecuted(WETH, _targetToken, _inputAmount, outputAmount, SwapVersion.V3);
         } catch {
-            // Unwrap WETH back to ETH and refund
-            IWETH(WETH).withdraw(_inputAmount);
+            // Refund ETH directly
             (bool success, ) = _refundAddress.call{value: _inputAmount}("");
             require(success, "ETH refund failed");
             revert("V3 swap failed");
@@ -554,7 +551,11 @@ contract AbokiV2Contract is Ownable, ReentrancyGuard {
     }
     
     /**
-     * @dev Internal function to execute token to token swap using V3
+     * @dev Internal function to execute token to token swap using V3 - FIXED
+     * Key fixes:
+     * 1. Handle ETH/WETH properly in multi-hop swaps
+     * 2. Better token transfer and approval logic
+     * 3. Check if first token is WETH to handle ETH input
      */
     function _executeTokenSwapV3(
         bytes calldata _path,
@@ -562,28 +563,72 @@ contract AbokiV2Contract is Ownable, ReentrancyGuard {
         uint256 _inputAmount,
         uint256 _minOutputAmount
     ) internal returns (uint256 outputAmount) {
-        // Transfer input tokens from user to contract
-        IERC20 inputToken = IERC20(_tokenIn);
-        require(inputToken.transferFrom(msg.sender, address(this), _inputAmount), "Transfer failed");
         
-        // Approve router to spend the input tokens
-        require(inputToken.approve(address(uniswapV3Router), _inputAmount), "Approval failed");
+        // Check if this is an ETH swap by looking at the first token in path
+        address firstToken = _extractFirstToken(_path);
+        bool isETHInput = (firstToken == WETH && msg.value > 0);
         
-        ISwapRouter.ExactInputParams memory params = ISwapRouter.ExactInputParams({
-            path: _path,
-            recipient: address(this),
-            deadline: block.timestamp + 300,
-            amountIn: _inputAmount,
-            amountOutMinimum: _minOutputAmount
-        });
-        
-        try uniswapV3Router.exactInput(params) returns (uint256 amountOut) {
-            outputAmount = amountOut;
-            emit SwapExecuted(_tokenIn, address(0), _inputAmount, outputAmount, SwapVersion.V3); // tokenOut not easily extractable from path
-        } catch {
-            // Refund the user if the swap fails
-            require(inputToken.transfer(msg.sender, _inputAmount), "Refund failed");
-            revert("V3 swap failed");
+        if (isETHInput) {
+            // ETH input case - use msg.value
+            require(msg.value == _inputAmount, "ETH amount mismatch");
+            
+            ISwapRouter.ExactInputParams memory params = ISwapRouter.ExactInputParams({
+                path: _path,
+                recipient: address(this),
+                amountIn: _inputAmount,
+                amountOutMinimum: _minOutputAmount
+            });
+            
+            try uniswapV3Router.exactInput{value: _inputAmount}(params) returns (uint256 amountOut) {
+                outputAmount = amountOut;
+                emit SwapExecuted(_tokenIn, address(0), _inputAmount, outputAmount, SwapVersion.V3);
+            } catch {
+                // Refund ETH
+                (bool success, ) = msg.sender.call{value: _inputAmount}("");
+                require(success, "ETH refund failed");
+                revert("V3 swap failed");
+            }
+        } else {
+            // Regular token input case
+            IERC20 inputToken = IERC20(_tokenIn);
+            require(inputToken.transferFrom(msg.sender, address(this), _inputAmount), "Transfer failed");
+            require(inputToken.approve(address(uniswapV3Router), _inputAmount), "Approval failed");
+            
+            ISwapRouter.ExactInputParams memory params = ISwapRouter.ExactInputParams({
+                path: _path,
+                recipient: address(this),
+                amountIn: _inputAmount,
+                amountOutMinimum: _minOutputAmount
+            });
+            
+            try uniswapV3Router.exactInput(params) returns (uint256 amountOut) {
+                outputAmount = amountOut;
+                emit SwapExecuted(_tokenIn, address(0), _inputAmount, outputAmount, SwapVersion.V3);
+            } catch {
+                // Refund tokens
+                require(inputToken.transfer(msg.sender, _inputAmount), "Refund failed");
+                revert("V3 swap failed");
+            }
+        }
+    }
+    
+    /**
+     * @dev Helper function to extract first token from V3 path - FIXED
+     */
+    function _extractFirstToken(bytes memory path) internal pure returns (address token) {
+        require(path.length >= 20, "Invalid path length");
+        assembly {
+            token := div(mload(add(path, 32)), 0x1000000000000000000000000)
+        }
+    }
+    
+    /**
+     * @dev Helper function to extract last token from V3 path - FIXED
+     */
+    function _extractLastToken(bytes memory path) internal pure returns (address token) {
+        require(path.length >= 20, "Invalid path length");
+        assembly {
+            token := div(mload(add(path, add(12, path))), 0x1000000000000000000000000)
         }
     }
     
@@ -846,5 +891,209 @@ contract AbokiV2Contract is Ownable, ReentrancyGuard {
             results[i] = supportedTokens[_tokens[i]];
         }
         return results;
+    }
+    
+    /**
+     * @dev Additional V3 function: Create order with ETH to token swap using multi-hop path
+     * @param _path The encoded V3 path (must start with WETH)
+     * @param _minOutputAmount The minimum amount of target tokens expected
+     * @param _rate The expected exchange rate for the created order
+     * @param _refundAddress The address to refund tokens if needed
+     * @param _liquidityProvider The address of the liquidity provider
+     * @param _feeRecipient The address to receive protocol fees
+     * @param _feePercent The fee percentage in basis points
+     * @return orderId The ID of the created order
+     */
+    function createOrderWithETHSwapV3MultiHop(
+        bytes calldata _path,
+        uint256 _minOutputAmount,
+        uint256 _rate,
+        address _refundAddress,
+        address _liquidityProvider,
+        address _feeRecipient,
+        uint256 _feePercent
+    ) external payable nonReentrant returns (uint256 orderId) {
+        require(msg.value > 0, "ETH required");
+        require(_minOutputAmount > 0, "Min output amount must be greater than 0");
+        require(_refundAddress != address(0), "Invalid refund address");
+        require(_liquidityProvider != address(0), "Invalid liquidity provider");
+        require(_feeRecipient != address(0), "Invalid fee recipient");
+        require(_feePercent <= 1000, "Fee too high");
+        require(address(uniswapV3Router) != address(0), "Uniswap V3 router not set");
+        require(WETH != address(0), "WETH address not set");
+        
+        // Extract target token from path
+        address targetToken = _extractLastToken(_path);
+        require(supportedTokens[targetToken], "Target token not supported");
+        
+        // Verify path starts with WETH
+        address firstToken = _extractFirstToken(_path);
+        require(firstToken == WETH, "Path must start with WETH for ETH swaps");
+        
+        uint256 inputAmount = msg.value;
+        uint256 outputAmount = _executeETHToTokenSwapV3MultiHop(_path, inputAmount, _minOutputAmount, _refundAddress);
+        
+        orderId = _createOrderAfterSwap(
+            targetToken,
+            outputAmount,
+            _rate,
+            _refundAddress,
+            _liquidityProvider,
+            _feeRecipient,
+            _feePercent
+        );
+    }
+    
+    /**
+     * @dev Internal function to execute ETH to token swap using V3 multi-hop
+     */
+    function _executeETHToTokenSwapV3MultiHop(
+        bytes calldata _path,
+        uint256 _inputAmount,
+        uint256 _minOutputAmount,
+        address _refundAddress
+    ) internal returns (uint256 outputAmount) {
+        
+        ISwapRouter.ExactInputParams memory params = ISwapRouter.ExactInputParams({
+            path: _path,
+            recipient: address(this),
+            amountIn: _inputAmount,
+            amountOutMinimum: _minOutputAmount
+        });
+
+        try uniswapV3Router.exactInput{value: _inputAmount}(params) returns (uint256 amountOut) {
+            outputAmount = amountOut;
+            emit SwapExecuted(WETH, address(0), _inputAmount, outputAmount, SwapVersion.V3);
+        } catch {
+            // Refund ETH directly
+            (bool success, ) = _refundAddress.call{value: _inputAmount}("");
+            require(success, "ETH refund failed");
+            revert("V3 multi-hop swap failed");
+        }
+    }
+    
+    /**
+     * @dev Create order with token to ETH swap using V3
+     * @param _tokenIn The input token address
+     * @param _fee The fee tier for the V3 pool
+     * @param _inputAmount The amount of input tokens
+     * @param _minETHAmount The minimum amount of ETH expected
+     * @param _rate The expected exchange rate for the created order
+     * @param _refundAddress The address to refund tokens if needed
+     * @param _liquidityProvider The address of the liquidity provider
+     * @param _feeRecipient The address to receive protocol fees
+     * @param _feePercent The fee percentage in basis points
+     * @return orderId The ID of the created order
+     */
+    function createOrderWithTokenToETHSwapV3(
+        address _tokenIn,
+        uint24 _fee,
+        uint256 _inputAmount,
+        uint256 _minETHAmount,
+        uint256 _rate,
+        address _refundAddress,
+        address _liquidityProvider,
+        address _feeRecipient,
+        uint256 _feePercent
+    ) external nonReentrant returns (uint256 orderId) {
+        require(_inputAmount > 0, "Input amount must be greater than 0");
+        require(_minETHAmount > 0, "Min ETH amount must be greater than 0");
+        require(_refundAddress != address(0), "Invalid refund address");
+        require(_liquidityProvider != address(0), "Invalid liquidity provider");
+        require(_feeRecipient != address(0), "Invalid fee recipient");
+        require(_feePercent <= 1000, "Fee too high");
+        require(address(uniswapV3Router) != address(0), "Uniswap V3 router not set");
+        require(WETH != address(0), "WETH address not set");
+        
+        uint256 ethAmount = _executeTokenToETHSwapV3(_tokenIn, _fee, _inputAmount, _minETHAmount);
+        
+        // For ETH orders, we treat WETH as the target token
+        orderId = _createOrderAfterETHSwap(
+            ethAmount,
+            _rate,
+            _refundAddress,
+            _liquidityProvider,
+            _feeRecipient,
+            _feePercent
+        );
+    }
+    
+    /**
+     * @dev Internal function to execute token to ETH swap using V3
+     */
+    function _executeTokenToETHSwapV3(
+        address _tokenIn,
+        uint24 _fee,
+        uint256 _inputAmount,
+        uint256 _minETHAmount
+    ) internal returns (uint256 ethAmount) {
+        // Transfer input tokens from user to contract
+        IERC20 inputToken = IERC20(_tokenIn);
+        require(inputToken.transferFrom(msg.sender, address(this), _inputAmount), "Transfer failed");
+        require(inputToken.approve(address(uniswapV3Router), _inputAmount), "Approval failed");
+        
+        ISwapRouter.ExactInputSingleParams memory params = ISwapRouter.ExactInputSingleParams({
+            tokenIn: _tokenIn,
+            tokenOut: WETH,
+            fee: _fee,
+            recipient: address(this),
+            amountIn: _inputAmount,
+            amountOutMinimum: _minETHAmount,
+            sqrtPriceLimitX96: 0
+        });
+
+        try uniswapV3Router.exactInputSingle(params) returns (uint256 wethAmount) {
+            // Unwrap WETH to ETH
+            IWETH(WETH).withdraw(wethAmount);
+            ethAmount = wethAmount;
+            emit SwapExecuted(_tokenIn, WETH, _inputAmount, ethAmount, SwapVersion.V3);
+        } catch {
+            // Refund tokens
+            require(inputToken.transfer(msg.sender, _inputAmount), "Refund failed");
+            revert("V3 token to ETH swap failed");
+        }
+    }
+    
+    /**
+     * @dev Internal function to create order after ETH swap
+     */
+    function _createOrderAfterETHSwap(
+        uint256 _ethAmount,
+        uint256 _rate,
+        address _refundAddress,
+        address _liquidityProvider,
+        address _feeRecipient,
+        uint256 _feePercent
+    ) internal returns (uint256 orderId) {
+        // Calculate and deduct fee
+        uint256 feeAmount = (_ethAmount * _feePercent) / 10000;
+        uint256 netAmount = _ethAmount - feeAmount;
+
+        // Transfer fees and amounts
+        if (feeAmount > 0) {
+            (bool feeSuccess, ) = _feeRecipient.call{value: feeAmount}("");
+            require(feeSuccess, "Fee transfer failed");
+        }
+        (bool lpSuccess, ) = _liquidityProvider.call{value: netAmount}("");
+        require(lpSuccess, "LP transfer failed");
+
+        // Store order - using address(0) to represent ETH
+        orderId = orderIdCounter++;
+        orders[orderId] = Order({
+            token: address(0), // ETH represented as address(0)
+            amount: _ethAmount,
+            rate: _rate,
+            creator: msg.sender,
+            refundAddress: _refundAddress,
+            liquidityProvider: _liquidityProvider,
+            feeRecipient: _feeRecipient,
+            feePercent: _feePercent,
+            isFulfilled: true,
+            isRefunded: false,
+            timestamp: block.timestamp
+        });
+
+        emit OrderCreated(orderId, address(0), _ethAmount, _rate, _refundAddress, _liquidityProvider, _feeRecipient, _feePercent);
+        emit OrderFulfilled(orderId, _liquidityProvider);
     }
 }
