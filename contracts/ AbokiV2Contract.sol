@@ -413,36 +413,67 @@ contract AbokiV2Contract is Ownable, ReentrancyGuard {
      * @return orderId The ID of the created order
      */
     function createOrderWithTokenSwapV3(
-        bytes calldata _path,
-        address _tokenIn,
-        address _tokenOut,
-        uint256 _inputAmount,
-        uint256 _minOutputAmount,
-        uint256 _rate,
-        address _refundAddress,
-        address _liquidityProvider,
-        address _feeRecipient,
-        uint256 _feePercent
+        address tokenIn,
+        address tokenOut,
+        uint24 fee,
+        uint256 inputAmount,
+        uint256 minOutputAmount,
+        uint256 rate,
+        address refundAddress,
+        address liquidityProvider,
+        address feeRecipient,
+        uint256 feePercent
     ) external nonReentrant returns (uint256 orderId) {
         require(address(uniswapV3Router) != address(0), "Uniswap V3 router not set");
-        require(_inputAmount > 0, "Input amount must be greater than 0");
-        require(_minOutputAmount > 0, "Min output amount must be greater than 0");
-        require(supportedTokens[_tokenOut], "Target token not supported");
-        require(_refundAddress != address(0), "Invalid refund address");
-        require(_liquidityProvider != address(0), "Invalid liquidity provider address");
-        require(_feeRecipient != address(0), "Invalid fee recipient");
-        require(_feePercent <= 1000, "Fee too high");
-        
-        uint256 outputAmount = _executeTokenSwapV3(_path, _tokenIn, _inputAmount, _minOutputAmount);
-        
+        require(inputAmount > 0, "Input amount must be greater than 0");
+        require(minOutputAmount > 0, "Min output amount must be greater than 0");
+        require(supportedTokens[tokenOut], "Target token not supported");
+        require(refundAddress != address(0), "Invalid refund address");
+        require(liquidityProvider != address(0), "Invalid liquidity provider address");
+        require(feeRecipient != address(0), "Invalid fee recipient");
+        require(feePercent <= 1000, "Fee too high");
+
+        // Transfer input tokens from user to contract
+        IERC20 inputToken = IERC20(tokenIn);
+        require(inputToken.transferFrom(msg.sender, address(this), inputAmount), "Transfer failed");
+
+        // Approve router if needed
+        uint256 allowance = inputToken.allowance(address(this), address(uniswapV3Router));
+        if (allowance < inputAmount) {
+            require(inputToken.approve(address(uniswapV3Router), type(uint256).max), "Approval failed");
+        }
+
+        // Encode path
+        bytes memory path = abi.encodePacked(tokenIn, fee, tokenOut);
+
+        // Build params
+        ISwapRouter.ExactInputParams memory params = ISwapRouter.ExactInputParams({
+            path: path,
+            recipient: address(this),
+            deadline: block.timestamp + 300,
+            amountIn: inputAmount,
+            amountOutMinimum: minOutputAmount
+        });
+
+        uint256 outputAmount;
+        try uniswapV3Router.exactInput(params) returns (uint256 amountOut) {
+            outputAmount = amountOut;
+            emit SwapExecuted(tokenIn, tokenOut, inputAmount, outputAmount, SwapVersion.V3);
+        } catch {
+            // Refund input tokens to user
+            require(inputToken.transfer(msg.sender, inputAmount), "Refund failed");
+            revert("V3 swap failed");
+        }
+
+        // Distribute output tokens (fee, LP, etc.)
         orderId = _createOrderAfterSwap(
-            _tokenOut,
+            tokenOut,
             outputAmount,
-            _rate,
-            _refundAddress,
-            _liquidityProvider,
-            _feeRecipient,
-            _feePercent
+            rate,
+            refundAddress,
+            liquidityProvider,
+            feeRecipient,
+            feePercent
         );
     }
     
